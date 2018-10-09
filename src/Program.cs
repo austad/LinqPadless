@@ -27,9 +27,9 @@ namespace LinqPadless
     using System.Reflection;
     using System.Runtime.InteropServices;
     using System.Runtime.Versioning;
+    using System.Security.Cryptography;
     using System.Text;
     using System.Text.RegularExpressions;
-    using System.Threading;
     using System.Xml;
     using System.Xml.Linq;
     using Mannex;
@@ -45,20 +45,12 @@ namespace LinqPadless
 
     static partial class Program
     {
-        static partial void Wain(IEnumerable<string> args)
+        static int Wain(IEnumerable<string> args)
         {
-            const string csx = "csx";
-            const string exe = "exe";
-
             var verbose = false;
             var help = false;
-            var recurse = false;
-            var force = false;
-            var watching = false;
-            var incremental = false;
             var extraPackageList = new List<PackageReference>();
             var extraImportList = new List<string>();
-            var target = csx;
             var targetFramework = NuGetFramework.Parse(Assembly.GetEntryAssembly().GetCustomAttribute<TargetFrameworkAttribute>().FrameworkName);
 
             var options = new OptionSet
@@ -66,17 +58,12 @@ namespace LinqPadless
                 { "?|help|h"      , "prints out the options", _ => help = true },
                 { "verbose|v"     , "enable additional output", _ => verbose = true },
                 { "d|debug"       , "debug break", _ => Debugger.Launch() },
-                { "r|recurse"     , "include sub-directories", _ => recurse = true },
-                { "f|force"       , "force continue on errors", _ => force = true },
-                { "w|watch"       , "watch for changes and re-compile outdated", _ => watching = true },
-                { "i|incremental" , "compile outdated scripts only", _ => incremental = true },
                 { "ref|reference=", "extra NuGet reference", v => { if (!string.IsNullOrEmpty(v)) extraPackageList.Add(ParseExtraPackageReference(v)); } },
                 { "imp|import="   , "extra import", v => { extraImportList.Add(v); } },
-                { "t|target="     , csx + " = C# script (default); " + exe + " = executable", v => target = v },
                 { "fx="           , $"target framework; default: {targetFramework}", v => targetFramework = NuGetFramework.Parse(v) },
             };
 
-            var tail = options.Parse(args.TakeWhile(arg => arg != "--"));
+            var tail = options.Parse(args);
 
             if (verbose)
                 Trace.Listeners.Add(new TextWriterTraceListener(Console.Error));
@@ -84,157 +71,76 @@ namespace LinqPadless
             if (help || tail.Count == 0)
             {
                 Help(options);
-                return;
+                return 0;
             }
 
-            var generator =
-                csx.Equals(target, StringComparison.OrdinalIgnoreCase)
-                ? GenerateCsx
-                : exe.Equals(target, StringComparison.OrdinalIgnoreCase)
-                ? (Generator) GenerateExecutable
-                : throw new Exception("Target is invalid or missing. Supported targets are: "
-                                      + string.Join(", ", csx, exe));
+            var scriptPath = tail.First();
+            var scriptArgs = tail.Skip(1);
+
+            string hash;
+            using (var sha = SHA1.Create())
+            {
+                hash = BitConverter.ToString(sha.ComputeHash(File.ReadAllBytes(scriptPath)))
+                                   .Replace("-", string.Empty)
+                                   .ToLowerInvariant();
+            }
+
+            retry:
+
+            var binDirPath = Path.Combine(Path.GetTempPath(), "lpless", "cache", hash);
+            if (Directory.Exists(binDirPath))
+            {
+                const string runtimeConfigJsonSuffix = ".runtimeconfig.json";
+                const string depsJsonSuffix = ".deps.json";
+
+                var baseNameSearches =
+                    Directory.GetFiles(binDirPath, "*.json")
+                             .Select(p => p.EndsWith(runtimeConfigJsonSuffix, StringComparison.OrdinalIgnoreCase) ? p.Substring(0, p.Length - runtimeConfigJsonSuffix.Length)
+                                        : p.EndsWith(depsJsonSuffix, StringComparison.OrdinalIgnoreCase) ? p.Substring(0, p.Length - depsJsonSuffix.Length)
+                                        : null);
+                var binPath = baseNameSearches.FirstOrDefault(p => p != null) is string s ? s + ".dll" : null;
+                if (binPath != null)
+                {
+                    using (var process = Process.Start(new ProcessStartInfo
+                    {
+                        UseShellExecute = false,
+                        FileName        = "dotnet",
+                        Arguments       = string.Join(" ", scriptArgs.Prepend(binPath)),
+                    }))
+                    {
+                        Debug.Assert(process != null);
+                        process.WaitForExit();
+                        return process.ExitCode;
+                    }
+                }
+            }
 
             extraImportList.RemoveAll(string.IsNullOrEmpty);
 
             // TODO Allow package source to be specified via args
-
-            var queries = GetQueries(tail, recurse);
 
             // TODO Allow packages directory to be specified via args
 
             const string packagesDirName = "packages";
 
             var compiler = Compiler(packagesDirName, extraPackageList, extraImportList,
-                                    targetFramework, generator,
-                                    watching || incremental, force, verbose);
+                                    targetFramework, binDirPath);
 
-            if (watching)
-            {
-                if (tail.Count > 1)
-                {
-                    // TODO Support multiple watch roots
-
-                    throw new NotSupportedException(
-                        "Watch mode does not support multiple file specifications. " +
-                        "Use a single wildcard specification instead instead to watch and re-compile several queries.");
-                }
-
-                var tokens = SplitDirFileSpec(tail.First()).Fold((dp, fs) =>
-                (
-                    dirPath : dp ?? Environment.CurrentDirectory,
-                    fileSpec: fs
-                ));
-
-                using (var cts = new CancellationTokenSource())
-                {
-                    Console.CancelKeyPress += (_, e) =>
-                    {
-                        // TODO Re-consider proper cancellation
-
-                        Console.WriteLine("Aborting...");
-                        // ReSharper disable once AccessToDisposedClosure
-                        cts.Cancel();
-                        e.Cancel = true;
-                    };
-
-                    var changes =
-                        FileMonitor.GetFolderChanges(
-                            tokens.dirPath, tokens.fileSpec,
-                            recurse,
-                            NotifyFilters.FileName
-                                | NotifyFilters.LastWrite,
-                            WatcherChangeTypes.Created
-                                | WatcherChangeTypes.Changed
-                                | WatcherChangeTypes.Renamed,
-                            cts.Token);
-
-                    foreach (var e in from cs in changes.Throttle(TimeSpan.FromSeconds(2))
-                                      select cs.Length)
-                    {
-                        Console.WriteLine($"{e} change(s) detected. Re-compiling...");
-
-                        var count = 0;
-                        var compiledCount = 0;
-                        // ReSharper disable once LoopCanBeConvertedToQuery
-                        // ReSharper disable once LoopCanBePartlyConvertedToQuery
-                        // ReSharper disable once PossibleMultipleEnumeration
-                        foreach (var query in queries)
-                        {
-                            // TODO Re-try on potential file locking issues
-
-                            var compiled = compiler(query);
-                            count++;
-                            compiledCount += compiled ? 1 : 0;
-                        }
-
-                        if (count > 1)
-                            Console.WriteLine($"Re-compiled {compiledCount:N0} of {count:N0} queries.");
-                    }
-                }
-            }
-            else
-            {
-                foreach (var query in queries)
-                    compiler(query);
-            }
+            compiler(scriptPath);
+            goto retry;
         }
 
-        static readonly char[] Wildchars = { '*', '?' };
         static readonly char[] PathSeparators = { Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar };
-
-        static (string dirPath, string fileName) SplitDirFileSpec(string spec)
-        {
-            var i = spec.LastIndexOfAny(PathSeparators);
-            // TODO handle rooted cases
-            return i >= 0
-                 ? (spec.Substring(0, i + 1), spec.Substring(i + 1))
-                 : (null, spec);
-        }
-
-        static IEnumerable<string> GetQueries(IEnumerable<string> tail,
-                                              bool includeSubdirs)
-        {
-            var dirSearchOption = includeSubdirs
-                                ? SearchOption.AllDirectories
-                                : SearchOption.TopDirectoryOnly;
-            return
-                from spec in tail
-                let tokens = SplitDirFileSpec(spec).Fold((dp, fs) =>
-                (
-                    dirPath : dp ?? Environment.CurrentDirectory,
-                    fileSpec: fs
-                ))
-                let dirPath = tokens.dirPath ?? Environment.CurrentDirectory
-                from e in
-                    tokens.fileSpec.IndexOfAny(Wildchars) >= 0
-                    ? from fi in new DirectoryInfo(dirPath).EnumerateFiles(tokens.fileSpec, dirSearchOption)
-                      select new { File = fi, Searched = true }
-                    : Directory.Exists(spec)
-                    ? from fi in new DirectoryInfo(spec).EnumerateFiles("*.linq", dirSearchOption)
-                      select new { File = fi, Searched = true }
-                    : new[] { new { File = new FileInfo(spec), Searched = false } }
-                where !e.Searched
-                      || (!e.File.Name.StartsWith(".", StringComparison.Ordinal)
-                          && 0 == (e.File.Attributes & (FileAttributes.Hidden | FileAttributes.System)))
-                select e.File.FullName;
-        }
-
-        delegate void Generator(string queryFilePath,
-            // ReSharper disable once UnusedParameter.Local
-            string packagesPath, QueryLanguage queryKind, string source,
-            IEnumerable<string> imports, IEnumerable<(string path, PackageReference sourcePackage)> references,
-            IndentingLineWriter writer);
 
         static Func<string, bool> Compiler(
             string packagesPath,
             IEnumerable<PackageReference> extraPackages,
             IEnumerable<string> extraImports,
             NuGetFramework targetFramework,
-            Generator generator,
+            string binDirPath,
             bool unlessUpToDate = false, bool force = false, bool verbose = false)
         {
-            var writer = IndentingLineWriter.Create(Console.Out);
+            var writer = IndentingLineWriter.Create(Console.Error);
 
             return queryFilePath =>
             {
@@ -262,9 +168,10 @@ namespace LinqPadless
                                        targetFramework,
                                        verbose, writer.Indent());
 
-                    generator(queryFilePath, packagesDir.FullName,
-                              info.queryKind, info.source, info.namespaces,
-                              info.references, writer.Indent());
+                    GenerateExecutable(binDirPath,
+                        queryFilePath, packagesDir.FullName,
+                        info.queryKind, info.source, info.namespaces,
+                        info.references, writer.Indent());
 
                     return true;
                 }
@@ -394,7 +301,7 @@ namespace LinqPadless
         static Dictionary<string, string> _dirPathByToken;
 
         public static Dictionary<string, string> DirPathByToken =>
-            _dirPathByToken ?? (_dirPathByToken = ResolvedDirTokens().ToDictionary(StringComparer.OrdinalIgnoreCase));
+            _dirPathByToken ?? (_dirPathByToken = Seq.ToDictionary(ResolvedDirTokens(), StringComparer.OrdinalIgnoreCase));
 
         static IEnumerable<(string token, string path)> ResolvedDirTokens()
         {
@@ -410,52 +317,6 @@ namespace LinqPadless
                 .DescendantNodes().OfType<MethodDeclarationSyntax>()
                 .Any(md => "Main" == md.Identifier.Text
                             && md.Modifiers.Any(m => m.IsKind(SyntaxKind.AsyncKeyword)));
-
-        static void GenerateCsx(string queryFilePath,
-            string packagesPath, QueryLanguage queryKind, string source,
-            IEnumerable<string> imports, IEnumerable<(string path, PackageReference sourcePackage)> references,
-            IndentingLineWriter writer)
-        {
-            var body = queryKind == QueryLanguage.Expression
-                     ? string.Join(Environment.NewLine, "System.Console.WriteLine(", source, ");")
-                     : queryKind == QueryLanguage.Program
-                     ? source + Environment.NewLine
-                              + (IsMainAsync(source) ? "await " : null)
-                              + "Main();"
-                     : source;
-
-            var rs = references.ToArray();
-
-            File.WriteAllLines(Path.ChangeExtension(queryFilePath, ".csx"),
-                from lines in new[]
-                {
-                    from r in rs
-                    select r.sourcePackage into p
-                    select new
-                    {
-                        p.Id,
-                        Version = p.HasVersion
-                                ? p.Version.ToString()
-                                : GetLatestPackageVersion(p.Id, p.IsPrereleaseAllowed).ToString()
-                    }
-                    into p
-                    select $"#r \"nuget: {p.Id}, {p.Version}\"",
-
-                    Seq.Return(string.Empty),
-
-                    from ns in imports
-                    select $"using {ns};",
-
-                    Seq.Return(body, string.Empty),
-                }
-                from line in lines
-                select line);
-
-            // TODO User-supplied csi.cmd
-
-            foreach (var ext in new[] { ".cmd", ".sh" })
-                GenerateBatch(LoadTextResource("dotnet-script" + ext), ext, queryFilePath, null, null);
-        }
 
         static readonly Encoding Utf8BomlessEncoding = new UTF8Encoding(encoderShouldEmitUTF8Identifier: false);
 
@@ -474,7 +335,7 @@ namespace LinqPadless
             }
         }
 
-        static void GenerateExecutable(string queryFilePath,
+        static void GenerateExecutable(string binDirPath, string queryFilePath,
             string packagesPath, QueryLanguage queryKind, string source,
             IEnumerable<string> imports, IEnumerable<(string path, PackageReference sourcePackage)> references,
             IndentingLineWriter writer)
@@ -524,9 +385,11 @@ namespace LinqPadless
             var rs = references.ToArray();
 
             var queryName = Path.GetFileNameWithoutExtension(queryFilePath);
-            var workingDirPath = Path.Combine(Path.GetDirectoryName(queryFilePath), queryName);
+            var workingDirPath = Path.ChangeExtension(binDirPath, ".src");
             if (!Directory.Exists(workingDirPath))
                 Directory.CreateDirectory(workingDirPath);
+
+            var csFilePath = Path.Combine(Path.GetDirectoryName(Path.GetFullPath(queryFilePath)), queryName + ".cs");
 
             var projectRoot =
                 new XElement("Project",
@@ -542,7 +405,8 @@ namespace LinqPadless
                                 new XAttribute("Include", r.sourcePackage.Id),
                                 r.sourcePackage.HasVersion
                                 ? new XAttribute("Version", r.sourcePackage.Version)
-                                : new XAttribute("Version", GetLatestPackageVersion(r.sourcePackage.Id, r.sourcePackage.IsPrereleaseAllowed)))));
+                                : new XAttribute("Version", GetLatestPackageVersion(r.sourcePackage.Id, r.sourcePackage.IsPrereleaseAllowed))),
+                        new XElement("Compile", new XAttribute("Include", csFilePath), new XAttribute("Link", queryName + ".cs"))));
 
             using (var xw = XmlWriter.Create(Path.Combine(workingDirPath, queryName + ".csproj"), new XmlWriterSettings
             {
@@ -554,7 +418,6 @@ namespace LinqPadless
                 projectRoot.WriteTo(xw);
             }
 
-            var csFilePath = Path.Combine(workingDirPath, "Program.cs");
             File.WriteAllLines(csFilePath,
                 from lines in new[]
                 {
@@ -570,8 +433,8 @@ namespace LinqPadless
 
             // TODO User-supplied dotnet.cmd
 
-            foreach (var ext in new[] { ".cmd", ".sh" })
-                GenerateBatch(LoadTextResource("dotnet" + ext), ext, queryFilePath, packagesPath, rs);
+            Spawn("dotnet", $@"publish -o ""{binDirPath}"" -c Release", workingDirPath, writer,
+                  exitCode => new Exception($"dotnet publish ended with a non-zero exit code of {exitCode}."));
         }
 
         static Version GetLatestPackageVersion(string id, bool isPrereleaseAllowed)
@@ -597,6 +460,42 @@ namespace LinqPadless
                                              .Element( d + "Version"));
 
             return versions.SingleOrDefault();
+        }
+
+        static void Spawn(string path, string args, string workingDirPath, IndentingLineWriter writer,
+                          Func<int, Exception> errorSelector)
+        {
+            using (var process = Process.Start(new ProcessStartInfo
+            {
+                CreateNoWindow         = true,
+                UseShellExecute        = false,
+                FileName               = path,
+                Arguments              = args,
+                RedirectStandardError  = true,
+                RedirectStandardOutput = true,
+                WorkingDirectory       = workingDirPath,
+            }))
+            {
+                Debug.Assert(process != null);
+
+                void OnStdDataReceived(object _, DataReceivedEventArgs e)
+                {
+                    if (e.Data == null)
+                        return;
+                    writer?.WriteLines(e.Data);
+                }
+
+                process.OutputDataReceived += OnStdDataReceived;
+                process.ErrorDataReceived  += OnStdDataReceived;
+
+                process.BeginOutputReadLine();
+                process.BeginErrorReadLine();
+                process.WaitForExit();
+
+                var exitCode = process.ExitCode;
+                if (exitCode != 0)
+                    throw errorSelector(exitCode);
+            }
         }
 
         static PackageReference ParseExtraPackageReference(string input)
